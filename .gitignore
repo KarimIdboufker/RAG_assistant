@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+myenv/
+
+# Secrets
+.env
+
+# PDFs are large — sync separately with rsync
+pdfs/
+
+# Model cache
+.cache/
+
+ANN/
