@@ -1,97 +1,63 @@
 """
-Structure-aware chunker — simplified.
+Simple sliding-window chunker.
 
-Input:  the dict produced by extractor.extract_paper()
-Output: list of chunk dicts ready for embedding + DB insert
-
-Chunk types:
-  "abstract" — the full abstract, one chunk
-  "body"     — a paragraph or group of paragraphs within a section
-
-Each chunk's "contextualized_content" prepends the paper title and section
-heading so the embedding is self-contained (no need for the surrounding doc).
+Splits pages into overlapping word-count chunks.
+No section detection — pure text only.
 """
+
+_OVERLAP_WORDS = 50     # words carried over from previous chunk to next
+_MIN_CHUNK_WORDS = 30   # discard chunks shorter than this
 
 
 def build_chunks(paper: dict, max_tokens: int = 400) -> list[dict]:
-    """
-    Returns:
-      [
-        {
-          "chunk_type": str,
-          "section": str,
-          "chunk_index": int,
-          "content": str,
-          "contextualized_content": str,
-          "page_num": int,          # always 0 — page tracking removed for simplicity
-        },
-        ...
-      ]
-    """
     title = paper["meta"].get("title") or "Unknown Paper"
     chunks: list[dict] = []
 
     # ── Abstract ─────────────────────────────────────────────────────────────
     if paper.get("abstract"):
         chunks.append(_make_chunk(
-            chunk_type="abstract",
             content=paper["abstract"],
-            section="Abstract",
+            chunk_type="abstract",
             title=title,
+            page_num=1,
         ))
 
-    # ── Body sections ─────────────────────────────────────────────────────────
-    for section in paper.get("sections", []):
-        heading = section["heading"]
-        paragraphs = [p.strip() for p in section["paragraphs"] if p.strip()]
+    # ── Body — sliding window over all pages ──────────────────────────────────
+    all_words: list[tuple[str, int]] = []  # (word, page_num)
+    for page in paper.get("pages", []):
+        for word in page["text"].split():
+            all_words.append((word, page["page_num"]))
 
-        buffer: list[str] = []
+    i = 0
+    while i < len(all_words):
+        window = all_words[i: i + max_tokens]
+        if len(window) < _MIN_CHUNK_WORDS:
+            break
 
-        for para in paragraphs:
-            buffer.append(para)
+        content = " ".join(w for w, _ in window)
+        page_num = window[0][1]
 
-            if _word_count(buffer) >= max_tokens:
-                # Flush everything except the last paragraph to avoid tiny leftover
-                flush, buffer = buffer[:-1], buffer[-1:]
-                if flush:
-                    chunks.append(_make_chunk(
-                        chunk_type="body",
-                        content="\n\n".join(flush),
-                        section=heading,
-                        title=title,
-                    ))
+        chunks.append(_make_chunk(
+            content=content,
+            chunk_type="body",
+            title=title,
+            page_num=page_num,
+        ))
 
-        if buffer:
-            chunks.append(_make_chunk(
-                chunk_type="body",
-                content="\n\n".join(buffer),
-                section=heading,
-                title=title,
-            ))
+        i += max_tokens - _OVERLAP_WORDS
 
-    # Assign sequential indices
-    for i, chunk in enumerate(chunks):
-        chunk["chunk_index"] = i
+    for idx, chunk in enumerate(chunks):
+        chunk["chunk_index"] = idx
 
     return chunks
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _word_count(paragraphs: list[str]) -> int:
-    return sum(len(p.split()) for p in paragraphs)
-
-
-def _make_chunk(chunk_type: str, content: str, section: str, title: str) -> dict:
+def _make_chunk(content: str, chunk_type: str, title: str, page_num: int) -> dict:
     return {
         "chunk_type": chunk_type,
-        "section": section,
+        "section": "",
         "chunk_index": 0,
         "content": content,
-        "contextualized_content": (
-            f"[Paper: {title}]\n[Section: {section}]\n\n{content}"
-        ),
-        "page_num": 0,
+        "contextualized_content": f"[Paper: {title}]\n\n{content}",
+        "page_num": page_num,
     }

@@ -1,27 +1,26 @@
 """
-Embedding via sentence-transformers (local, no API key required).
-
-Default model: allenai-specter2  — trained on scientific papers, 768 dims.
-Swap via EMBEDDING_MODEL in .env, e.g.:
-  EMBEDDING_MODEL=all-MiniLM-L6-v2   (faster, 384 dims, set EMBEDDING_DIM=384)
+Embedding via OpenAI API (text-embedding-3-small, 1536 dims).
 """
 
-from sentence_transformers import SentenceTransformer
+import openai
 
 from app.config import settings
 
-_model: SentenceTransformer | None = None
+_client: openai.OpenAI | None = None
 
 
-def _get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(settings.embedding_model)
-    return _model
+def _get_client() -> openai.OpenAI:
+    global _client
+    if _client is None:
+        _client = openai.OpenAI(api_key=settings.openai_api_key)
+    return _client
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    vectors = _get_model().encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    return [v.tolist() for v in vectors]
+    response = _get_client().embeddings.create(
+        model=settings.embedding_model,
+        input=texts,
+    )
+    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]

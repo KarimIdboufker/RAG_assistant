@@ -13,8 +13,8 @@ sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 pgvector>=0.3.0
 
-# Embeddings (local, no API key required)
-sentence-transformers>=3.0.0
+# Embeddings
+openai>=1.0.0
 
 # AI Generation
 anthropic>=0.40.0

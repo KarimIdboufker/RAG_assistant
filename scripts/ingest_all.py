@@ -51,6 +51,7 @@ def main():
                     ok += 1
             except Exception as exc:
                 print(f"  ERROR {label}  →  {exc}")
+                db.rollback()
                 err += 1
     finally:
         db.close()

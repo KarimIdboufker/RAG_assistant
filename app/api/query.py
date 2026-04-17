@@ -13,6 +13,9 @@ router = APIRouter()
 
 _anthropic_client: anthropic.Anthropic | None = None
 
+_MIN_SCORE = 0.25       # discard chunks below this cosine similarity
+_MAX_PER_PAPER = 3      # cap chunks from any single paper
+
 
 def _anthropic() -> anthropic.Anthropic:
     global _anthropic_client
@@ -50,11 +53,13 @@ class QueryResponse(BaseModel):
 
 @router.post("/", response_model=QueryResponse)
 def query(req: QueryRequest, db: Session = Depends(get_db)):
-    # 1. Embed the question
-    q_emb = embed_texts([req.question])[0]
+    # 1. Embed the question — prefix matches chunk contextualized_content format
+    prefixed = f"[Query]\n\n{req.question}"
+    q_emb = embed_texts([prefixed])[0]
     emb_str = "[" + ",".join(map(str, q_emb)) + "]"
 
-    # 2. Vector similarity search with pgvector
+    # 2. Vector similarity search — fetch more candidates than top_k to allow filtering
+    fetch_k = req.top_k * 4
     rows = db.execute(
         text("""
             SELECT
@@ -64,6 +69,7 @@ def query(req: QueryRequest, db: Session = Depends(get_db)):
                 c.page_num,
                 p.title,
                 p.authors,
+                p.id AS paper_id,
                 1 - (c.embedding <=> cast(:emb as vector)) AS score
             FROM chunks c
             JOIN papers p ON c.paper_id = p.id
@@ -71,19 +77,43 @@ def query(req: QueryRequest, db: Session = Depends(get_db)):
             ORDER BY c.embedding <=> cast(:emb as vector)
             LIMIT :k
         """),
-        {"emb": emb_str, "k": req.top_k},
+        {"emb": emb_str, "k": fetch_k},
     ).fetchall()
 
-    if not rows:
+    # 3. Filter by score threshold and cap per paper
+    paper_counts: dict = {}
+    filtered = []
+    for row in rows:
+        if row.score < _MIN_SCORE:
+            continue
+        pid = str(row.paper_id)
+        if paper_counts.get(pid, 0) >= _MAX_PER_PAPER:
+            continue
+        paper_counts[pid] = paper_counts.get(pid, 0) + 1
+        filtered.append(row)
+        if len(filtered) >= req.top_k:
+            break
+
+    if not filtered:
         return QueryResponse(
-            answer="No relevant content found in the knowledge base.",
+            answer="No sufficiently relevant content found in the knowledge base.",
             sources=[],
         )
 
-    # 3. Build context for Claude
+    # 4. Build context for Claude — include paper metadata as a header
+    seen_titles = {}
+    for row in filtered:
+        if row.title and row.title not in seen_titles:
+            seen_titles[row.title] = row.authors
+
+    meta_block = "\n".join(
+        f"- {title} (Authors: {authors or 'unknown'})"
+        for title, authors in seen_titles.items()
+    )
+
     context_blocks = [
         f"[{row.title or 'Unknown'} — {row.section or ''}]\n{row.content}"
-        for row in rows
+        for row in filtered
     ]
     context = "\n\n---\n\n".join(context_blocks)
 
@@ -96,11 +126,12 @@ def query(req: QueryRequest, db: Session = Depends(get_db)):
             page_num=row.page_num or 0,
             score=round(float(row.score), 4),
         )
-        for row in rows
+        for row in filtered
     ]
 
-    # 4. Generate answer with Claude
+    # 5. Generate answer with Claude
     prompt = (
+        f"Papers referenced below:\n{meta_block}\n\n"
         f"Context from academic papers:\n\n{context}\n\n"
         f"Question: {req.question}"
     )
@@ -121,7 +152,4 @@ def query(req: QueryRequest, db: Session = Depends(get_db)):
 
     answer = next(b.text for b in response.content if b.type == "text")
 
-    return QueryResponse(
-        answer=answer,
-        sources=sources,
-    )
+    return QueryResponse(answer=answer, sources=sources)

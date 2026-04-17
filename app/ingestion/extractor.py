@@ -1,50 +1,35 @@
 """
-PDF structure extractor — simplified.
+PDF text extractor — simplified to plain text only.
 
 Extracts:
   - Metadata: title, authors (from PDF properties or page-1 heuristics)
-  - Abstract: detected by keyword, kept as a single block
-  - Sections: heading + body paragraphs, grouped together
-  - Stops at the first of: References / Bibliography / Acknowledgements
+  - Abstract: detected by keyword search in early pages
+  - Pages: clean text per page
 
 Returns:
   {
-    "meta":  {"title": str|None, "authors": str|None, "filename": str},
+    "meta":     {"title": str|None, "authors": str|None, "filename": str},
     "abstract": str|None,
-    "sections": [{"heading": str, "paragraphs": [str, ...]}, ...]
+    "pages":    [{"text": str, "page_num": int}, ...]
   }
 """
 
+import re
 from collections import Counter
 
-import fitz  # pymupdf
+import fitz
 
 
-# Section headings that mark the end of the main body
-_STOP_HEADINGS = {
-    "references", "bibliography", "works cited",
-    "acknowledgements", "acknowledgments", "appendix",
-}
+_STOP_SECTIONS = {"references", "bibliography", "works cited", "acknowledgements", "acknowledgments"}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_paper(pdf_path: str) -> dict:
     doc = fitz.open(pdf_path)
     body_size = _detect_body_font_size(doc)
     meta = _extract_metadata(doc, body_size)
-
-    raw_sections = _extract_sections(doc, body_size)
-    abstract, sections = _split_abstract(raw_sections)
-
+    pages, abstract = _extract_pages(doc)
     doc.close()
-    return {
-        "meta": meta,
-        "abstract": abstract,
-        "sections": sections,
-    }
+    return {"meta": meta, "abstract": abstract, "pages": pages}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,7 +41,6 @@ def _extract_metadata(doc: fitz.Document, body_size: float) -> dict:
     title = (pdf_meta.get("title") or "").strip() or None
     authors = (pdf_meta.get("author") or "").strip() or None
 
-    # ArXiv PDFs almost always have empty metadata — extract from page 1
     if (not title or not authors) and len(doc) > 0:
         title_h, authors_h = _heuristic_metadata(doc[0], body_size)
         title = title or title_h
@@ -66,14 +50,7 @@ def _extract_metadata(doc: fitz.Document, body_size: float) -> dict:
 
 
 def _heuristic_metadata(page: fitz.Page, body_size: float) -> tuple[str | None, str | None]:
-    """
-    On the first page of an academic paper:
-      - Title   = the largest text block (significantly above body size)
-      - Authors = the next-largest block (slightly above body or same size but
-                  contains commas / numbers suggesting author list)
-    """
-    candidates: list[tuple[float, str]] = []  # (avg_size, text)
-
+    candidates: list[tuple[float, str]] = []
     for block in page.get_text("dict")["blocks"]:
         if block["type"] != 0:
             continue
@@ -85,38 +62,23 @@ def _heuristic_metadata(page: fitz.Page, body_size: float) -> tuple[str | None, 
                     sizes.append(span["size"])
                     texts.append(t)
         if sizes:
-            avg = sum(sizes) / len(sizes)
-            candidates.append((avg, " ".join(texts)))
+            candidates.append((sum(sizes) / len(sizes), " ".join(texts)))
 
-    # Sort largest first
     candidates.sort(key=lambda x: x[0], reverse=True)
-
-    title = None
-    authors = None
-
-    for i, (size, text) in enumerate(candidates[:6]):  # only inspect top blocks
+    title, authors = None, None
+    for size, text in candidates[:6]:
         if size < body_size + 1:
             break
         if title is None:
             title = text
         elif authors is None and _looks_like_authors(text):
             authors = text
-
     return title, authors
 
 
 def _looks_like_authors(text: str) -> bool:
-    """Rough heuristic: author lines have commas, numbers (affiliations), or 'and'."""
-    return (
-        "," in text
-        or " and " in text.lower()
-        or any(c.isdigit() for c in text)
-    )
+    return "," in text or " and " in text.lower() or any(c.isdigit() for c in text)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Font analysis
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_body_font_size(doc: fitz.Document) -> float:
     sizes: list[float] = []
@@ -132,108 +94,84 @@ def _detect_body_font_size(doc: fitz.Document) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section extraction
+# Page extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_sections(doc: fitz.Document, body_size: float) -> list[dict]:
-    """
-    Walk all pages and build a flat list of sections:
-      [{"heading": str, "paragraphs": [str, ...]}, ...]
+def _extract_pages(doc: fitz.Document) -> tuple[list[dict], str | None]:
+    pages = []
+    abstract: str | None = None
+    abstract_lines: list[str] = []
+    in_abstract = False
 
-    Stops when a stop-heading (References etc.) is encountered.
-    """
-    sections: list[dict] = []
-    current: dict = {"heading": "Preamble", "paragraphs": []}
-    stop = False
-
-    for page in doc:
-        if stop:
+    for page_num, page in enumerate(doc):
+        raw = page.get_text("text")
+        if _hits_stop_section(raw):   # check raw — lines are still intact
             break
+        cleaned = _clean_text(raw)
+        if not cleaned:
+            continue
 
-        # Sort blocks top→bottom, left→right (handles two-column layouts roughly)
-        blocks = sorted(
-            page.get_text("dict")["blocks"],
-            key=lambda b: (round(b["bbox"][1] / 20), b["bbox"][0]),
-        )
+        # Detect and extract abstract from early pages
+        if abstract is None and page_num < 3:
+            abstract, in_abstract, abstract_lines = _try_extract_abstract(
+                cleaned, in_abstract, abstract_lines
+            )
 
-        for block in blocks:
-            if block["type"] != 0:  # skip image blocks
-                continue
+        pages.append({"text": cleaned, "page_num": page_num + 1})
 
-            block_text, is_heading = _classify_block(block, body_size)
-            if not block_text:
-                continue
+    if abstract is None and abstract_lines:
+        abstract = " ".join(abstract_lines).strip() or None
 
-            if is_heading:
-                # Check for stop-section
-                if block_text.strip().lower().rstrip(".") in _STOP_HEADINGS:
-                    stop = True
-                    break
-
-                # Save previous section and start a new one
-                if current["paragraphs"]:
-                    sections.append(current)
-                current = {"heading": block_text.strip(), "paragraphs": []}
-            else:
-                current["paragraphs"].append(block_text)
-
-    if current["paragraphs"]:
-        sections.append(current)
-
-    return sections
+    return pages, abstract
 
 
-def _classify_block(block: dict, body_size: float) -> tuple[str, bool]:
-    """
-    Returns (text, is_heading).
-    A block is a heading if its dominant font is significantly larger or bold
-    relative to the body baseline.
-    """
-    lines_text: list[str] = []
-    heading_spans = 0
-    total_spans = 0
-
-    for line in block["lines"]:
-        parts = []
-        for span in line["spans"]:
-            t = span["text"].strip()
-            if not t:
-                continue
-            total_spans += 1
-            size = span["size"]
-            bold = bool(span["flags"] & 2**4)
-            if size >= body_size + 2 or (bold and size >= body_size + 0.5):
-                heading_spans += 1
-            parts.append(span["text"])
-        if parts:
-            lines_text.append("".join(parts))
-
-    text = "\n".join(lines_text).strip()
-    is_heading = total_spans > 0 and (heading_spans / total_spans) >= 0.6
-
-    return text, is_heading
+def _clean_text(text: str) -> str:
+    text = text.replace("\x00", "")  # strip NUL chars — Postgres rejects them
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[\d\s\-–—]+", line):  # page numbers, rules
+            continue
+        if len(line) < 3:
+            continue
+        lines.append(line)
+    return " ".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Abstract separation
-# ─────────────────────────────────────────────────────────────────────────────
+def _hits_stop_section(text: str) -> bool:
+    # Check each original line, not just the joined string
+    for line in text.splitlines():
+        line = line.strip().lower().rstrip(".")
+        if line in _STOP_SECTIONS:
+            return True
+    return False
 
-def _split_abstract(sections: list[dict]) -> tuple[str | None, list[dict]]:
-    """
-    Find the abstract section (by heading keyword or position) and return it
-    separately from the body sections.
-    """
-    abstract_text: str | None = None
-    body_sections: list[dict] = []
 
-    for section in sections:
-        heading_lower = section["heading"].lower()
-        if abstract_text is None and (
-            "abstract" in heading_lower
-            or heading_lower in ("preamble", "summary")
-        ):
-            abstract_text = "\n\n".join(section["paragraphs"]).strip() or None
-        else:
-            body_sections.append(section)
+def _try_extract_abstract(
+    text: str,
+    in_abstract: bool,
+    lines: list[str],
+) -> tuple[str | None, bool, list[str]]:
+    lower = text.lower()
 
-    return abstract_text, body_sections
+    if not in_abstract and "abstract" in lower:
+        idx = lower.index("abstract")
+        after = text[idx + len("abstract"):].strip().lstrip("—:-").strip()
+        if len(after) > 80:
+            return after[:3000], False, []
+        in_abstract = True
+        if after:
+            lines.append(after)
+        return None, True, lines
+
+    if in_abstract:
+        # Stop collecting when we hit a numbered section heading
+        if re.match(r"^1[\.\s]", text.strip()):
+            return " ".join(lines).strip() or None, False, lines
+        lines.append(text[:2000])
+        if len(" ".join(lines)) > 2000:
+            return " ".join(lines).strip(), False, []
+
+    return None, in_abstract, lines
