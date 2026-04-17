@@ -64,11 +64,11 @@ def query(req: QueryRequest, db: Session = Depends(get_db)):
                 c.page_num,
                 p.title,
                 p.authors,
-                1 - (c.embedding <=> :emb::vector) AS score
+                1 - (c.embedding <=> cast(:emb as vector)) AS score
             FROM chunks c
             JOIN papers p ON c.paper_id = p.id
             WHERE c.embedding IS NOT NULL
-            ORDER BY c.embedding <=> :emb::vector
+            ORDER BY c.embedding <=> cast(:emb as vector)
             LIMIT :k
         """),
         {"emb": emb_str, "k": req.top_k},
